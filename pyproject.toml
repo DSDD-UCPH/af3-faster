@@ -1,0 +1,42 @@
+# af3-faster — one pip wrapper: existing AlphaFold 3 + vendored Pallas/FPF core.
+# Native AlphaFold 3 files are never edited. Works on alphafold3-colabfold (OF3
+# included) and google-deepmind/alphafold3 (AF3 weights only).
+#
+#   pip install af3_faster-*.whl          # into the env that already has alphafold3
+#   af3-faster --json_path=in.json --output_dir=out --model_dir=weights
+#
+# Vendor refresh (maintainers):
+#   python tools/trace_opt_core.py
+#   python tools/build_vendor.py
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "af3-faster"
+version = "0.2.0"
+description = "Fast-mode wrapper for an existing AlphaFold 3 install: FlashPairformer + Pallas levers + 4090/5090 tiles"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+af3-faster = "af3_faster.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["af3_faster*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.md", "*.txt", "*.NOTICE", "NOTICE*", "LICENSE*", "*.LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

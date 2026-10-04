@@ -1,0 +1,2 @@
+recursive-include af3_faster *.json *.md *.txt *.NOTICE NOTICE* LICENSE* *.LICENSE
+global-exclude __pycache__ *.py[cod] *.so *.cubin

@@ -1,0 +1,192 @@
+# af3-faster
+
+One pip package that speeds up an **existing** AlphaFold 3 install. It does not edit native files and does not change the checkpoint. Fast mode is the default.
+
+Two native trees:
+
+* **alphafold3-colabfold ≥ 3.1.7** (sokrypton / ColabFold): AF3, OpenFold3, and OpenBind0 (`--model alphafold3|openfold3|openbind0`).
+* **google-deepmind/alphafold3** (orig): AF3 weights only. `--model openfold3|openbind0` is refused.
+
+Hoists (do the same work once instead of hundreds of times) are **on by default on both trees**. Colabfold 3.1.7+ already does pair/atom conditioning hoist and noise-level sharing in native code, so the kit copies of those are skipped there. Orig gets the kit copies. Pair-logit hoist (`HOIST_LOGITS`) runs on both.
+
+## Install
+
+```bash
+# environment already has alphafold3, jax, haiku, tokamax
+pip install af3_faster-0.2.0-py3-none-any.whl
+```
+
+AlphaFold 3 must be an editable checkout (so `run_alphafold.py` sits above the `alphafold3` package), or set `AF3_RUN_ALPHAFOLD` to that script. A plain wheel does not ship the runner.
+
+Measured cards: RTX 4090 (cc 8.9) and RTX 5090 (cc 12.0). Other tile rows are in the table. Precompiled `triattn_xla` cubins are not in this package, so that row steps aside to another attention kernel.
+
+## Run
+
+```bash
+af3-faster --json_path=in.json --output_dir=out --model_dir=weights
+af3-faster --mode fast --model openfold3 --json_path=in.json --output_dir=out --model_dir=weights   # colabfold only
+af3-faster --mode off  ...          # native, no kit levers
+af3-faster doctor                   # stack / GPU / tile / lever preview
+```
+
+Turn one lever off: `--no-sampler-bf16`, `--no-hoist-logits`, or `MODEL_OPT_LEVERS_OFF=SAMPLER_BF16,HOIST_LOGITS,DIFFUSION_HOIST`.
+
+## Measured end-to-end
+
+Poly-alanine 1024 tokens with MSA, 4 seeds, 5 diffusion samples. Time is `Running model inference and extracting output structures with 4 seed(s)`. Seed 1 includes compile.
+
+| Tree | Weights | GPU | Off | Fast | Speedup |
+|------|---------|-----|-----|------|---------|
+| colabfold native | AF3 | 4090 | 278.68s | 164.52s | 1.69× |
+| colabfold native | AF3 | 5090 | 157.31s | 119.01s | 1.32× |
+| colabfold native | OF3 | 4090 | 285.04s | 155.82s | 1.83× |
+| colabfold native | OF3 | 5090 | 159.92s | 111.29s | 1.44× |
+| orig | AF3 | 4090 | 333.43s | 197.77s | 1.69× |
+| orig | AF3 | 5090 | 195.07s | 147.28s | 1.32× |
+
+Orig fast includes pair-logit hoist. Pair-conditioning hoist (`DIFFUSION_HOIST`) is now also on for orig; the orig fast column above was measured before that extra hoist, so orig may improve further.
+
+Most of the gain is the pairformer kernels (triangle multiply + triangle attention) plus sampler attention/GEMMs. Hoists are “don’t redo work” rather than a new algorithm.
+
+## What each optimization does
+
+Two output classes:
+
+* **Same math** — same operations, often in a different order or once instead of many times. Structures should match native within ordinary GPU noise. Not always bitwise (XLA may fuse differently).
+* **Tolerance** — same trained weights, different GPU arithmetic (bf16 tensor cores, flash attention, fused kernels). Coordinates can move a little. Not a different model.
+
+Isolated per-lever timings were not run; “how much” below is the role in the 1024-token fold, not a promise of +X seconds on every job.
+
+### 1. FlashPairformer (triangle multiply + triangle attention)
+
+**What.** The pairformer is the slow heart of the trunk: for every residue pair it updates a square table of size N×N. Native does that with large matrix multiplies and attention that materialise huge intermediate tensors. FlashPairformer replaces those two blocks with fused GPU kernels that keep the working set in fast memory.
+
+**How much.** Usually the largest slice of the speedup, especially on the 4090. It runs 48 trunk blocks per recycle, plus MSA, templates, and the confidence head.
+
+**Output.** Tolerance. Same weights; bf16 re-association. Not bitwise vs `--mode off`.
+
+Default: `AF3_FLASHPAIRFORMER=both`. Off: `AF3_FLASHPAIRFORMER=off`.
+
+### 2. TRIMUL_CD and TRIATT_XLA
+
+**What.** Same two pairformer sites, served through the kit’s kernel table so the fastest available row for this GPU/JAX/size is used (FlashPairformer’s own row, another Pallas row, or a fallback). If a row cannot run, the next one is used by name — the fold does not die.
+
+**How much.** Overlaps FlashPairformer; they are how those kernels are actually dispatched. Small extra when FPF already hit its fused row.
+
+**Output.** Tolerance, same class as FlashPairformer.
+
+### 3. DATTN (diffusion / pairformer single attention)
+
+**What.** During structure sampling the model runs a 24-block transformer on tokens, 200 times, with a pair-bias attention. Native builds a full heads×N×N logit tensor. DATTN uses a flash (blockwise) attention kernel instead.
+
+**How much.** Large in the **sampler**, which dominates after the trunk. Also covers pairformer single attention.
+
+**Output.** Tolerance. Flash softmax is not bitwise vs the stock einsum.
+
+### 4. ATOM_ATTN
+
+**What.** Atoms attend in small windows (32 queries × 128 keys), 3 encoder + 3 decoder blocks, every denoising step. Native materialises those window logits; this uses a fused windowed kernel.
+
+**How much.** Medium. Always on in the sampler; also the evoformer atom encoder.
+
+**Output.** Tolerance. Padded empty windows write zeros instead of a mean of V (those rows are masked anyway).
+
+### 5. SAMPLER_BF16
+
+**What.** Native AF3 keeps the sampler in float32. This keeps the residual stream in float32 (so sums stay stable) but runs the big GEMMs on bf16 tensor cores.
+
+**How much.** Medium in the sampler (24 token blocks + atom stacks × 200 steps × 5 samples).
+
+**Output.** Tolerance. Not native `bfloat16='all'` (that would bf16 the residual too). Off: `--no-sampler-bf16`.
+
+### 6. TTR (fused transitions)
+
+**What.** Pairformer “feed-forward” blocks are LayerNorm → SwiGLU → projection. TTR fuses that so the wide intermediate never hits GPU memory.
+
+**How much.** Medium on the pair stack (C=128). Single-channel C=384 stays on tokamax (no fused row).
+
+**Output.** Tolerance.
+
+### 7. LNP (LayerNorm kernels)
+
+**What.** Standalone LayerNorms on pair / MSA / template planes go through a row-wise GPU kernel. Adaptive LayerNorms in the diffusion transformer stay native (different formula).
+
+**How much.** Small–medium. Many calls, each cheaper than attention.
+
+**Output.** Tolerance (f32 stats, different summation).
+
+### 8. DIFFUSION_HOIST (pair conditioning, once per sample)
+
+**What.** Each denoising step used to rebuild a token-pair conditioning table (LayerNorm, projection, two transitions on N×N×128) that does **not** depend on the noisy coordinates or the noise level. That is the same work ~200 times. Hoist builds it once and reuses it.
+
+**How much.** Medium–large on **orig** (native orig still rebuilt it every step). On colabfold 3.1.7+ native already does this, so the kit copy is skipped (`native_pair_atom_cond`).
+
+**Output.** Same math. Default **on** (`AF3_DIFFUSION_HOIST=1`), including orig.
+
+### 9. ATOM_COND_HOIST (atom pair table, once per sample)
+
+**What.** The atom encoder builds a pair table from the reference conformer and trunk embeddings — also independent of the noisy positions. Native orig rebuilds it every step. This computes it once, including the small pair-logit projections.
+
+**How much.** Medium on orig at large atom counts (memory: the stash grows with atoms). Colabfold native already caches this; kit copy skipped (`native_atom_cond`). Needs diffusion hoist’s once-per-sample step on orig.
+
+**Output.** Same math. Default **on**.
+
+### 10. HOIST_LOGITS (pair-logit projections, once per sample)
+
+**What.** After the pair tables exist, each transformer still did LayerNorm + Linear to make per-block attention biases, every step. Those projections are loop-invariant. This runs them once and indexes the result.
+
+* AF3: atom encoder/decoder (the token transformer already shares one projection per super-block inside the step).
+* OF3: also the 24 token-transformer blocks (per-block pair LayerNorm).
+
+**How much.** Small on AF3 after compile (~0.4 s/seed at 1024 tokens vs fast without this hoist). First seeds can look slower because the extra precompute graph compiles. Larger on OF3 (24 token blocks). **On by default for orig and colabfold.**
+
+**Output.** Same math. Off: `--no-hoist-logits`.
+
+### 11. COND_SHARE (one noise embedding for all samples in a step)
+
+**What.** Five samples are drawn per seed. The noise schedule is the same for all five, but orig carried it inside the per-sample loop, so the noise embedding and AdaLN projections were computed five times. This computes them once per step and broadcasts.
+
+**How much.** Medium on orig (5× less of that work). Colabfold native already shares it; skipped (`native_sample_scan_share`).
+
+**Output.** Same math. Default **on**.
+
+### 12. Kernel-tile `--buckets`
+
+**What.** Pads crop length to a multiple of 64 so fused kernels have a legal size. Native would otherwise pick a bucket the kernels cannot serve and fall back to slow stock.
+
+**How much.** Indirect: keeps the fast kernels on. Does not change the model.
+
+**Output.** Same as native with that bucket list. Skipped if you already pass `--buckets`.
+
+### 13. Compile-cache key (device kind)
+
+**What.** JAX’s persistent cache otherwise keys on a machine fingerprint, so a 4090 job recompiles on another 4090. The key is reduced to GPU model + stack versions.
+
+**How much.** Zero on a warm cache on the same box; large wall-time win when reusing a cache directory across identical GPUs.
+
+**Output.** None (reuse only).
+
+### 14. Templates census
+
+**What.** Logs which template slots are real vs dummy. Does not change featurisation.
+
+**How much.** None.
+
+**Output.** None.
+
+## Defaults on orig vs colabfold
+
+| Lever | Fast default | Colabfold native | Orig |
+|-------|--------------|------------------|------|
+| FlashPairformer, DATTN, ATOM_ATTN, SAMPLER_BF16, TTR, TRIMUL_CD, TRIATT_XLA, LNP | on | kit | kit |
+| HOIST_LOGITS | on | kit | kit |
+| DIFFUSION_HOIST | on | skip (native already) | kit |
+| ATOM_COND_HOIST | on | skip (native already) | kit |
+| COND_SHARE | on | skip (native already) | kit |
+
+## Rebuild the vendor tree (maintainers)
+
+```bash
+python tools/trace_opt_core.py
+python tools/build_vendor.py
+```
